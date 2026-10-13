@@ -160,7 +160,22 @@ SAIL_DEFAULT = {
     ],
 }
 
-PRESETS = {"wps_equivalent": WPS_EQUIVALENT, "sail_default": SAIL_DEFAULT}
+# --------------------------------------------------------------------------
+# sail_3dep: sail_default with terrain from USGS 3DEP 1" (~30 m) GeoTIFF tiles
+# --------------------------------------------------------------------------
+# Directory of USGS_1_<tile>.tif files: the SAILGEOG_3DEP_PATH environment variable (no default)
+DEP3_ROOT = os.environ.get("SAILGEOG_3DEP_PATH", "")
+SAIL_3DEP = copy.deepcopy(SAIL_DEFAULT)
+SAIL_3DEP["name"] = "sail_3dep"
+SAIL_3DEP["description"] = ("sail_default, but terrain = area mean of USGS 3DEP 1\" (~30 m) over the model cell "
+                            "(16 x 16 sub-grid) + the same slope-limited filter (max 0.5 m/m); 3DEP vertical "
+                            "datum NAVD88, horizontal NAD83 (treated as WGS84, < 2 m)")
+SAIL_3DEP["fields"][0] = dict(name="HGT_M", kind="continuous", source=DEP3_ROOT, method="area_mean",
+                              opts={"supersample": 16, "fill": "nearest_valid"}, fill_missing=0.0,
+                              filter={"name": "slope_limited", "max_slope": 0.5, "kappa": 0.2},
+                              extras=["HGT_M_RAW", "HGT_M_STD", "SLOPE"])
+
+PRESETS = {"wps_equivalent": WPS_EQUIVALENT, "sail_default": SAIL_DEFAULT, "sail_3dep": SAIL_3DEP}
 
 
 def get(name):
