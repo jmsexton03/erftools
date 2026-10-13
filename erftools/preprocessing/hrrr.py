@@ -81,14 +81,16 @@ class NativeHRRR(object):
     consistent with WRF
     """
 
-    def __init__(self,datetime,varlist=gribvars,verbose=False):
+    def __init__(self,datetime,varlist=gribvars,verbose=False,save_dir=None):
         """Download data from native levels, see
         https://www.nco.ncep.noaa.gov/pmb/products/hrrr/
         for data inventory
         """
         self.datetime = datetime
         self.verbose = verbose
-        self.H = Herbie(datetime, model='hrrr', product='nat')
+        # Local fix: explicit Herbie save_dir, no fallback to Herbie's default
+        herbie_kw = {} if save_dir is None else {'save_dir': save_dir}
+        self.H = Herbie(datetime, model='hrrr', product='nat', **herbie_kw)
         self.H.download(verbose=True)
         self._combine_data(varlist)
         self._setup_hrrr_grid()
@@ -467,9 +469,10 @@ class NativeHRRR(object):
         """Create a new Dataset with HRRR fields interpolated to the
         input grid points
         """
-        lat  , lon   = self.grid.calc_lat_lon()
-        lat_u, lon_u = self.grid.calc_lat_lon('U')
-        lat_v, lon_v = self.grid.calc_lat_lon('V')
+        # Local fix: NestedGrids.calc_lat_lon returns one array per level (2d2b8f9)
+        lat  , lon   = [a[0] for a in self.grid.calc_lat_lon()]
+        lat_u, lon_u = [a[0] for a in self.grid.calc_lat_lon('U')]
+        lat_v, lon_v = [a[0] for a in self.grid.calc_lat_lon('V')]
 
         msf   = self.grid.calc_msf(lat)
         msf_u = self.grid.calc_msf(lat_u)
@@ -563,8 +566,9 @@ class NativeHRRR(object):
             'BYE': 'south_north',
         }
 
-        lat_u, _ = self.grid.calc_lat_lon('U')
-        lat_v, _ = self.grid.calc_lat_lon('V')
+        # Local fix: NestedGrids.calc_lat_lon returns one array per level (2d2b8f9)
+        lat_u = self.grid.calc_lat_lon('U')[0][0]
+        lat_v = self.grid.calc_lat_lon('V')[0][0]
 
         # create data subsets for each boundary
         bdy = {}
@@ -591,6 +595,10 @@ class NativeHRRR(object):
             ]
             for varn in unstag_interp_vars:
                 ds[varn] = self.interpxy(varn, self.xg[idxs], self.yg[idxs], dtype=dtype)
+            # Local fix: ERF (ERF_ReadFromWRFBdy.cpp, "Convert perturbational moist
+            # pot. temp.") reads T_B* as coupled perturbation MOIST theta, as WRF writes it
+            # with use_theta_m=1; erftools wrote the dry perturbation.
+            ds['T'] = self.interpxy('THM', self.xg[idxs], self.yg[idxs], dtype=dtype)
 
             # setup map scale factors
             sn_ew_idxs = idxs[::-1]
@@ -638,6 +646,12 @@ class NativeHRRR(object):
                                                 'south_north': idxs[1]})
                     mu = mu.rename({width_dim[bname]:'bdy_width'})
                     mu = mu.transpose('bdy_width',lat_dim)
+                    if bname in ('BXE', 'BYE'):
+                        # Local fix: bdy_width index 0 is the OUTERMOST cell on every
+                        # side (WRF convention; ERF reads x_hi/y_hi at bigEnd - i,
+                        # ERF_ReadFromWRFBdy.cpp:1068-1075). slice(-bdy_width, None) gives the
+                        # hi sides innermost-first, so reverse them.
+                        mu = mu.isel(bdy_width=slice(None, None, -1))
                     ds[f'MU_{bname}'] = mu.expand_dims('Time',axis=0)
                 else:
                     # these dimensions may or may not be staggered
@@ -654,6 +668,9 @@ class NativeHRRR(object):
                                                  sn_dim: idxs[1]})
                     fld = fld.rename({bw_dim:'bdy_width'})
                     fld = fld.transpose('bdy_width',bt_dim,lat_dim)
+                    if bname in ('BXE', 'BYE'):
+                        # Local fix: hi sides outermost-first, see MU above
+                        fld = fld.isel(bdy_width=slice(None, None, -1))
                     ds[f'{varn}_{bname}'] = fld.expand_dims('Time',axis=0)
         return ds
 
@@ -733,6 +750,11 @@ def get_mass_weighted(varname,ds,**dims):
     # mut   = f(x_or_y)
     # C1,C2 = f(z)
     coupled = da * (C1*mut + C2)
+    if varname == 'PH':
+        # Local fix: ERF un-couples PH_B* by the column mass alone,
+        # dpht = (PH_B/mu + PHB) (ERF_ReadFromWRFBdy.cpp:472), not by (C1F mu + C2F);
+        # couple it the way ERF reads it, or the reconstructed boundary density is ~2.5 % low aloft.
+        coupled = da * mut
 
     # couple momenta to inverse map factors
     if varname == 'U':
