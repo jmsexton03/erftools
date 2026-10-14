@@ -25,7 +25,8 @@ grid points instead of interpolating, so to_wrfinput / to_wrfbdy (with their bou
 coupling and orientation conventions) are reused unchanged.
 
 Static land fields from any geo_em-style NetCDF: read_geogrid, check_geogrid_grid,
-map_static_fields (the one geo_em -> wrfinput mapping), add_geogrid_land_fields.
+map_static_fields (the one geo_em -> wrfinput mapping; with lsm_fields also VEGFRA, SHDMIN,
+SHDMAX, LAI, ALBBCK, SNOALB and TMN), add_geogrid_land_fields.
 Soil state (TSLB, SMOIS, SH2O, ZS, DZS) is NOT handled here, see
 soil_state_from_hrrr.
 
@@ -368,7 +369,8 @@ def remap_snapshot(snap, hgt_new, eta, p_top=10000.0, lapse_rate=STD_LAPSE, chec
 #                optional (defaults from the MMINLU table below)
 #   soil       : SCT_DOM, or SOILCTOP(soil_cat) -> dominant category
 #   LANDMASK   : optional; derived as LU != ISWATER/ISLAKE if absent
-#   LSM only   : SOILTEMP, GREENFRAC(month=12), LAI12M(month=12), January first
+#   LSM only   : SOILTEMP [K, sea level], GREENFRAC(month=12) [fraction], LAI12M(month=12),
+#                ALBEDO12M(month=12) [percent], SNOALB [percent]; months January first
 # Nothing here depends on WPS file names or WPS-only attributes.
 
 # category indices by land-use table (WRF LANDUSE.TBL / VEGPARM.TBL conventions)
@@ -378,6 +380,8 @@ LANDUSE_TABLES = {
     'NLCD40': {'ISWATER': 17, 'ISLAKE': -1, 'ISICE': 15, 'ISURBAN': 13},
 }
 ISOILWATER_DEFAULT = 14  # STAS / STAS-RUC soil tables
+LSM_GEO_FIELDS = ('SOILTEMP', 'GREENFRAC', 'LAI12M', 'ALBEDO12M', 'SNOALB')
+WATER_ALBEDO = 0.08      # real.exe ALBBCK / SNOALB over water
 
 
 def read_geogrid(path):
@@ -437,6 +441,19 @@ def monthly_interp_to_date(field12, date):
     raise ValueError(f'no bracketing months for {date}')
 
 
+def _monthly(geo, name):
+    """A 12-month geo_em field as (12, south_north, west_east) float64, January first. The
+    month axis is found by name ('month', as geogrid writes it), not by position."""
+    da = geo[name]
+    mdim = 'month' if 'month' in da.dims else None
+    if mdim is None or da.sizes[mdim] != 12:
+        raise ValueError(f'{name} must have a 12-long month dimension, got {dict(da.sizes)}')
+    arr = da.transpose(mdim, ...).values.astype(np.float64)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f'{name} has non-finite values')
+    return arr
+
+
 def _dominant(frac):
     """1-based index of the largest fraction along axis 0 (geogrid's dominant category;
     ties -> lowest index)."""
@@ -451,12 +468,20 @@ def map_static_fields(geo, date, lsm_fields=False, sst=None, mminlu=None, num_la
       ISLTYP   = nint(SCT_DOM)  [or dominant SOILCTOP]; land with ISOILWATER soil -> 8,
                  water -> ISOILWATER
       LANDMASK = LANDMASK [or IVGTYP not water/lake]
-      with lsm_fields:
-      VEGFRA   = 100 x GREENFRAC interpolated to `date` (monthly_interp_to_date)
+      with lsm_fields (inputs: LSM_GEO_FIELDS):
+      VEGFRA   = 100 x GREENFRAC interpolated to `date` (monthly_interp_to_date), [0, 100];
+                 0 on water
       SHDMIN/SHDMAX = 100 x min/max of GREENFRAC over the 12 months
-      LAI      = LAI12M interpolated to `date`
+      LAI      = LAI12M interpolated to `date`, >= 0
+      ALBBCK   = ALBEDO12M interpolated to `date` / 100 (percent -> fraction), on water 0.08
+      SNOALB   = SNOALB / 100 (maximum snow albedo), on water 0.08
       TMN      = SOILTEMP - 0.0065 HGT_M on land (share/module_soil_pre.F adjust_soil_temp_new,
                  Noah / Noah-MP), = sst on water if sst is given
+    The water values and the percent conversions follow WRF real.exe as documented
+    (module_initialize_real.F); there is no WRF source in this repository to check them against.
+    GREENFRAC must be a fraction (geogrid writes it so): a percent field raises, since 100 x
+    percent would pass every later check. The Noah-MP reader of ERF reads VEGFRA, LAI, SHDMIN,
+    SHDMAX and TMN but not ALBBCK or SNOALB, which are written for WRF parity.
 
     Returns (fields: name -> 2-D float64 array, attrs: MMINLU, NUM_LAND_CAT, IS* for wrfinput)."""
     def attr(name, override=None):
@@ -502,13 +527,23 @@ def map_static_fields(geo, date, lsm_fields=False, sst=None, mminlu=None, num_la
     isltyp = np.where(~land & (isltyp != isoilwater), float(isoilwater), isltyp)
     out = {'IVGTYP': ivgtyp, 'ISLTYP': isltyp, 'LANDMASK': landmask}
     if lsm_fields:
-        gf = geo['GREENFRAC'].values.astype(np.float64)  # (month, sn, we)
-        if gf.shape[0] != 12:
-            raise ValueError('GREENFRAC must have 12 months first')
-        out['VEGFRA'] = 100.0 * monthly_interp_to_date(gf, date)
+        missing = [v for v in LSM_GEO_FIELDS if v not in geo]
+        if missing:
+            raise KeyError(f'lsm_fields needs {missing} in the geo_em-style dataset')
+        gf = _monthly(geo, 'GREENFRAC')
+        if gf.min() < 0.0 or gf.max() > 1.0 + 1e-6:
+            raise ValueError(f'GREENFRAC must be a fraction in [0, 1], range '
+                             f'[{gf.min():g}, {gf.max():g}]')
+        out['VEGFRA'] = np.where(land, np.clip(100.0 * monthly_interp_to_date(gf, date), 0.0, 100.0), 0.0)
         out['SHDMIN'] = 100.0 * gf.min(axis=0)
         out['SHDMAX'] = 100.0 * gf.max(axis=0)
-        out['LAI'] = monthly_interp_to_date(geo['LAI12M'].values.astype(np.float64), date)
+        out['LAI'] = np.maximum(monthly_interp_to_date(_monthly(geo, 'LAI12M'), date), 0.0)
+        albbck = monthly_interp_to_date(_monthly(geo, 'ALBEDO12M'), date) / 100.0
+        snoalb = geo['SNOALB'].values.astype(np.float64) / 100.0
+        for name, alb in (('ALBBCK', albbck), ('SNOALB', snoalb)):
+            if not np.all(np.isfinite(alb)) or np.any(alb < 0.0) or np.any(alb > 1.0):
+                raise ValueError(f'{name} outside [0, 1] after the percent conversion')
+            out[name] = np.where(land, alb, WATER_ALBEDO)
         tmn = geo['SOILTEMP'].values.astype(np.float64) - STD_LAPSE * geo['HGT_M'].values
         if sst is not None:
             tmn = np.where(land, tmn, np.asarray(sst, dtype=np.float64))
@@ -519,7 +554,8 @@ def map_static_fields(geo, date, lsm_fields=False, sst=None, mminlu=None, num_la
 
 def add_geogrid_land_fields(inp, geo, date, lsm_fields=False, dtype=np.float32, **kw):
     """Write map_static_fields into a to_wrfinput Dataset (Time, south_north, west_east) and
-    carry MMINLU / NUM_LAND_CAT / IS* as global attributes. SST/TSK are left as they are."""
+    carry MMINLU / NUM_LAND_CAT / IS* as global attributes. SST/TSK are left as they are;
+    with lsm_fields, TMN over water is the dataset's SST."""
     sst = inp['SST'].values[0] if 'SST' in inp else None
     fields, attrs = map_static_fields(geo, date, lsm_fields=lsm_fields, sst=sst, **kw)
     for name, arr in fields.items():
