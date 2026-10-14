@@ -16,6 +16,10 @@ points:
    (adjust_soil_temp=True) the soil temperature adjusted to the new terrain with a constant
    lapse rate, as WRF real.exe adjust_soil_temp_new (per WRF documentation, not verified
    against source here).
+4. snow_from_hrrr: SNOW (WEASD), SNOWH (SNOD, through the snow density), SNOWC (HRRR's
+   snow cover) and CANWAT, by plain land-only interpolation (method='interp'). Where the
+   output terrain resolves much more than HRRR's 3 km terrain, method='elevation' makes SWE
+   follow HRRR's own local SWE-vs-terrain gradient (tunable, see snow_from_hrrr).
 
 real.exe behaviour quoted here is as documented for module_initialize_real.F and
 share/module_soil_pre.F; there is no WRF source in this repository to check it against.
@@ -46,7 +50,14 @@ SURFACE_GRIB_NAMES = {
     'orog': ('HGT', 1.0),
     't': ('SKINT', 1.0),
     'ci': ('SEAICE', 1.0),
+    'sdwe': ('SNOW', 1.0),     # WEASD [kg m-2]
+    'sde': ('SNOWH', 1.0),     # SNOD [m]
+    'snowc': ('SNOWC', 0.01),  # SNOWC [%] -> fraction
+    'cnwat': ('CANWAT', 1.0),  # CNWAT [kg m-2]
 }
+SNOWC_THRESHOLD = 10.0         # kg m-2: real.exe SNOWC = 1 where SNOW >= 10
+SNOW_DENSITY_DEFAULT = 200.0   # kg m-3: SNOWH = 0.005 SNOW (real.exe; NoahmpInitMainMod)
+SNOW_DENSITY_RANGE = (50.0, 600.0)
 
 
 def _open_cfgrib(path, keys, indexpath):
@@ -288,3 +299,152 @@ def soil_state_from_hrrr(land, regrid, hgt_new, landmask, tmn=None, tsk=None, ss
         v = fields[k][:, land_out]
         stats[f'{k}_land_range'] = [float(v.min()), float(v.max())] if v.size else []
     return fields, stats
+
+
+def local_gradient(f, hgt, valid, x1, y1, radius=9000.0, min_points=6, min_relief=50.0):
+    """At every source point, the weighted least-squares slope df/dhgt of f against the
+    terrain over the valid points within `radius` [m] (Gaussian weights, sigma = radius / 2),
+    and the maximum of f over the same points. The slope is 0 where fewer than min_points
+    points are valid or the weighted terrain standard deviation is below min_relief [m].
+    Returns (slope, local_max), both (ny, nx); local_max is 0 where no point is valid."""
+    dx = float(np.median(np.diff(x1)))
+    dy = float(np.median(np.diff(y1)))
+    ri, rj = int(radius // dx), int(radius // dy)
+    ny, nx = f.shape
+    v = np.asarray(valid, bool) & np.isfinite(f) & np.isfinite(hgt)
+    fz = np.where(v, f, 0.0)
+    zz = np.where(v, hgt, 0.0)
+    sums = np.zeros((6, ny, nx))  # n, w, wz, wf, wzz, wzf
+    fmax = np.full((ny, nx), -np.inf)
+    sigma = 0.5 * radius
+    for oj in range(-rj, rj + 1):
+        for oi in range(-ri, ri + 1):
+            d = np.hypot(oi * dx, oj * dy)
+            if d > radius:
+                continue
+            w = np.exp(-0.5 * (d / sigma) ** 2)
+            # shifted views: target [ty, tx] <- source [sy, sx]
+            ty = slice(max(-oj, 0), ny - max(oj, 0))
+            sy = slice(max(oj, 0), ny - max(-oj, 0))
+            tx = slice(max(-oi, 0), nx - max(oi, 0))
+            sx = slice(max(oi, 0), nx - max(-oi, 0))
+            m = v[sy, sx]
+            z, g = zz[sy, sx], fz[sy, sx]
+            sums[0][ty, tx] += m
+            sums[1][ty, tx] += w * m
+            sums[2][ty, tx] += w * m * z
+            sums[3][ty, tx] += w * m * g
+            sums[4][ty, tx] += w * m * z * z
+            sums[5][ty, tx] += w * m * z * g
+            fmax[ty, tx] = np.maximum(fmax[ty, tx], np.where(m, g, -np.inf))
+    n, sw, swz, swf, swzz, swzf = sums
+    ok = n >= min_points
+    sw = np.where(ok, sw, 1.0)
+    var_z = swzz / sw - (swz / sw) ** 2
+    ok &= var_z >= min_relief ** 2
+    cov = swzf / sw - (swz / sw) * (swf / sw)
+    slope = np.where(ok, cov / np.where(ok, var_z, 1.0), 0.0)
+    return slope, np.where(np.isfinite(fmax), fmax, 0.0)
+
+
+def snow_from_hrrr(land, regrid, hgt_new, landmask, method='interp', radius=9000.0,
+                   min_points=6, min_relief=50.0, max_gradient=1.0, cap='local_max',
+                   snowc='hrrr', snowc_threshold=SNOWC_THRESHOLD,
+                   density_range=SNOW_DENSITY_RANGE):
+    """Snow and canopy water at the output mass points from read_hrrr_land fields (SNOW and
+    LANDMASK / HGT required; SNOWH, SNOWC, CANWAT used when present). Land points use land
+    HRRR points only (LandRegridder); water points get 0 in every field.
+
+    SWE (SNOW [kg m-2]):
+      method='interp' (default): bilinear (land-only) interpolation of HRRR's SNOW.
+      method='elevation' (option, for output terrain much finer than HRRR's): SNOW_i +
+          b (hgt_new - HGT_i), clipped to >= 0, where _i is the land-only interpolation and b
+          [kg m-2 per m of height] HRRR's own local slope of SNOW against HRRR's terrain
+          (local_gradient over `radius` [m], with min_points and min_relief [m]), clipped to
+          +-max_gradient and interpolated like the rest. Where HRRR's SNOW is linear in its
+          terrain this is exact at any new height. cap='local_max' also bounds SNOW by the
+          largest HRRR SNOW within `radius` (no snow deeper than HRRR has nearby, e.g. on
+          peaks above every HRRR cell); cap=None does not. These parameters are tunable and
+          case-dependent; the defaults (radius 9000 m, min_points 6, min_relief 50 m,
+          max_gradient 1 kg m-2 per m, cap 'local_max') are example values for a 3 km source
+          and a 500 m target, not recommendations. They are ignored with method='interp'.
+    SNOWH [m] = SNOW / rho, rho = HRRR's density SNOW / SNOWH interpolated over HRRR's snow-
+      covered land points (SNOW >= 1 and SNOWH >= 0.005), in density_range; without HRRR snow
+      depth (or no snow nearby) rho = SNOW_DENSITY_DEFAULT (Noah-MP's own SNOWH = 0.005 SNOW).
+      So either method moves SWE and keeps HRRR's local density.
+    SNOWC: snowc='hrrr' (default) interpolates HRRR's snow cover fraction (land points only)
+      and zeroes it where SNOW is 0; snowc='threshold' (real.exe) is 1 where SNOW >=
+      snowc_threshold, else 0. With HRRR's thin snow the threshold leaves much of a snow-
+      covered domain bare, so HRRR's own cover is the default.
+    CANWAT [kg m-2] = land-only interpolation of HRRR's CNWAT, >= 0 (0 if absent). Noah-MP
+      reads it but starts from CANWAT = 0 (NoahmpInitMainMod) whatever the file holds.
+
+    Returns (fields: SNOW, SNOWH, SNOWC, CANWAT, each of the output shape; stats dict)."""
+    if method not in ('interp', 'elevation'):
+        raise ValueError(f'unknown method {method!r}')
+    if cap not in (None, 'local_max') or snowc not in ('threshold', 'hrrr'):
+        raise ValueError(f'unknown cap {cap!r} or snowc {snowc!r}')
+    if 'SNOW' not in land:
+        raise KeyError(f"{land.attrs.get('source', 'HRRR file')}: no SNOW (WEASD)")
+    hgt_new = np.asarray(hgt_new, np.float64)
+    land_out = np.asarray(landmask) > 0.5
+    valid = land['LANDMASK'].values > 0.5
+    swe_src = np.maximum(land['SNOW'].values.astype(np.float64), 0.0)
+    swe_i, nfall = regrid(swe_src, valid)
+    stats = {'snow_method': method, 'snow_points_nearest_fallback': nfall}
+    if method == 'elevation':
+        hgt_src = land['HGT'].values.astype(np.float64)
+        slope, fmax = local_gradient(swe_src, hgt_src, valid, land['x'].values, land['y'].values,
+                                     radius, min_points, min_relief)
+        slope = np.clip(slope, -max_gradient, max_gradient)
+        hgt_i, _ = regrid(hgt_src, valid)
+        b_i, _ = regrid(slope, valid)
+        swe = np.maximum(swe_i + b_i * (hgt_new - hgt_i), 0.0)
+        if cap == 'local_max':
+            cap_i, _ = regrid(fmax, valid)
+            stats['snow_points_capped'] = int((land_out & (swe > cap_i)).sum())
+            swe = np.minimum(swe, cap_i)
+        g = slope[valid & (swe_src > 0)]
+        stats.update({'snow_radius_m': radius, 'snow_cap': cap,
+                      'snow_gradient_kg_m2_per_km_p10_p50_p90':
+                          [float(1e3 * q) for q in np.percentile(g, [10, 50, 90])] if g.size else []})
+    else:
+        swe = swe_i
+    swe = np.where(land_out, swe, 0.0)
+
+    lo, hi = density_range
+    rho = np.full(hgt_new.shape, SNOW_DENSITY_DEFAULT)
+    if 'SNOWH' in land:
+        sd = land['SNOWH'].values.astype(np.float64)
+        snowy = valid & (swe_src >= 1.0) & (sd >= 0.005)
+        if snowy.any():
+            rho_src = np.clip(swe_src / np.where(snowy, sd, 1.0), lo, hi)
+            rho, _ = regrid(rho_src, snowy)
+    snowh = np.where(swe > 0.0, swe / rho, 0.0)
+
+    if snowc == 'threshold':
+        cover = (swe >= snowc_threshold).astype(np.float64)
+    else:
+        if 'SNOWC' not in land:
+            raise KeyError("snowc='hrrr' needs SNOWC in the HRRR fields")
+        cover, _ = regrid(np.clip(land['SNOWC'].values, 0.0, 1.0), valid)
+        cover = np.where(swe > 0.0, cover, 0.0)
+    cover = np.where(land_out, cover, 0.0)
+    if 'CANWAT' in land:
+        canwat, _ = regrid(np.maximum(land['CANWAT'].values, 0.0), valid)
+    else:
+        canwat = np.zeros(hgt_new.shape)
+    canwat = np.where(land_out, canwat, 0.0)
+
+    nland = max(int(land_out.sum()), 1)
+    stats.update({
+        'SNOW_land_range_kg_m2': [float(swe[land_out].min()), float(swe[land_out].max())]
+        if land_out.any() else [],
+        'SNOWH_land_range_m': [float(snowh[land_out].min()), float(snowh[land_out].max())]
+        if land_out.any() else [],
+        'land_fraction_snow_ge_threshold': float((land_out & (swe >= snowc_threshold)).sum() / nland),
+        'snowc': snowc, 'SNOWC_land_mean': float(cover[land_out].mean()) if land_out.any() else 0.0,
+        'snow_density_kg_m3_range': [float(rho[land_out].min()), float(rho[land_out].max())]
+        if land_out.any() else [],
+    })
+    return {'SNOW': swe, 'SNOWH': snowh, 'SNOWC': cover, 'CANWAT': canwat}, stats
